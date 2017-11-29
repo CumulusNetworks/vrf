@@ -61,7 +61,7 @@ create_instance_sysv()
 	(
 	echo "# ${VRFGEN_NOTE}"
 	while read line; do
-		if [[ $line =~ ("Exec".*=[[:space:]]*[^/]*)(\/.*) ]]; then
+		if [[ $line =~ (Exec[^=]+=[[:space:]]*[^/]*)(\/.*) ]]; then
 			# use full match here to keep all context
 			echo "${BASH_REMATCH[1]}/bin/ip vrf exec %i ${BASH_REMATCH[2]}"
 		else
@@ -104,7 +104,7 @@ handle_overrides()
 		echo "# ${VRFGEN_NOTE}"
 
 		while read line; do
-			if [[ $line =~ ("Exec".*=[[:space:]]*[^/]*)(\/.*) ]]; then
+			if [[ $line =~ (Exec[^=]+=[[:space:]]*[^/]*)(\/.*) ]]; then
 				[ -z "${BASH_REMATCH[2]}" ] && continue
 				# use full match here to keep all context
 				echo "${BASH_REMATCH[1]}/bin/ip vrf exec %i ${BASH_REMATCH[2]}"
@@ -142,7 +142,7 @@ create_vrf_override()
 	echo
 	echo "[Service]"
 	while read line; do
-		if [[ $line =~ ("Exec".*=[[:space:]]*[^/]*)(\/.*) ]]; then
+		if [[ $line =~ (Exec[^=]+=[[:space:]]*[^/]*)(\/.*) ]]; then
 			# directive is the part before the '='
 			set -- ${BASH_REMATCH[1]/=*}
 			d=${1}
