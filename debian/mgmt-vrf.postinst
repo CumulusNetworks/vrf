@@ -19,6 +19,16 @@ set -e
 
 DIVERT_DIR=/usr/share/mgmt-vrf
 
+# Install alternatives to ping and traceroute
+for c in /usr/bin/traceroute /usr/sbin/traceroute /usr/bin/traceroute6 /bin/ping /bin/ping6
+do
+	d=$(dirname $c)
+	f=$(basename $c)
+	mkdir -p ${DIVERT_DIR}/${d}
+	dpkg-divert --divert ${DIVERT_DIR}/${c} --rename ${c}
+	ln -s /usr/lib/mgmt-vrf/${f}.sh ${c}
+done
+
 # Configure libpam_script
 # - we only care about the use of pam_script_ses_open and that it looks for
 #   and runs commands in /usr/share/libpam-script/pam-script.d/

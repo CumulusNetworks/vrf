@@ -2,22 +2,27 @@
 #
 # VRF admin script
 #
-# This script is mostly a wrapper around ip commands used to create and
-# configure VRFs. The intent is to provide a better and cleaner user
-# experience for managing VRFs on Linux.
+# This script is mostly a wrapper around ip and cgroups commands used to
+# create and configure VRFs. The intent is to provide a better and cleaner
+# user experience for managing VRFs on Linux. Perhaps one day this becomes
+# a subcommand of ip (ip vrf ...)
 
 PROG=${0##*/}
+
+CGRPDIR=/sys/fs/cgroup/l3mdev
 
 VERBOSE=0
 
 # metric for unreachable default routes added to each vrf table
 # - static routes for IPv6 default to a metric of 1024 (IP6_RT_PRIO_USER)
 #   so our unreachable default should be below that
-RT_METRIC=8192
+RT_METRIC=4278198272
 
 # Allowed table id range
 TBID_MIN=1001
 TBID_MAX=1255
+
+MISSING_IPV6_DEF_RT=6
 
 ################################################################################
 # utilities
@@ -34,9 +39,42 @@ function dev_exists
 	ip link show dev ${1} >/dev/null 2>&1
 }
 
+
+# return device index for given device name
+
+function dev_index
+{
+	local dev=$1
+	local idx
+
+	idx=$(ip -o link show dev ${dev} 2>/dev/null | awk '{print $1}')
+	idx=${idx/:}
+	echo $idx
+
+	[ -z "$idx" ] && return 1
+
+	return 0
+}
+
+# Look up master device for a link
+
+function dev_get_master
+{
+	local dev=$1
+
+	ip -o link show dev $dev | awk '{
+	for (i = 0; i < NF; ++i) {
+		if ($i == "master") {
+			j=i+1
+			print $j
+			i=NF
+		}
+	}
+	}'
+}
+
 function get_comm
 {
-	[ ! -f /proc/$1/status ] && return
 	awk '$1 == "Name:" {print $2}' /proc/$1/status
 }
 
@@ -60,9 +98,9 @@ function get_vrf_arg
 {
 	local vrf
 
-	vrf="${1//[^a-zA-Z0-9_-.]/}"
+	vrf="${1//[^a-zA-Z0-9_.\-]/}"
 	if [ "$vrf" != "$1" ]; then
-		echo "Invalid VRF" >&2
+		echo "Invalid VRF name" >&2
 		return 1
 	fi
 
@@ -86,6 +124,22 @@ function get_tbid_arg
 ################################################################################
 # cgroup functions
 
+function l3mdev_cgroup_exists
+{
+	if [ -e ${CGRPDIR} ];
+	then
+		return 0
+	fi
+
+	echo
+	echo "Cgroup for managing VRF context does not exist."
+	echo "Has l3mdev cgroup patch been applied to kernel?"
+	echo "If so has it been enabled?"
+	echo
+
+	return 1
+}
+
 function vrf_cgroup_exists
 {
 	local vrf=$1
@@ -97,15 +151,52 @@ function vrf_cgroup_exists
 	return 1
 }
 
+# return l3mdev cgroup task is associated with
+function vrf_get_cgroup
+{
+	local p=$1
+	local c
+
+	if [ ! -e /proc/$p/cgroup ]; then
+		if [ ! -e /proc/$p ]; then
+			echo "Process does not exist."
+		else
+			echo "cgroup entry does not exist for process."
+		fi
+		return 1
+	fi
+
+	c=$(grep l3mdev /proc/$p/cgroup | awk -F':' '{print $NF}')
+	# strip leading '/'; makes default VRF ""
+	echo ${c/\/}
+}
+
+# configure cgroup for VRF
+function vrf_configure_cgroup
+{
+	local vrf=$1
+
+	l3mdev_cgroup_exists
+	[ $? -ne 0 ] && return 0
+
+	log_cmd "cgcreate -g l3mdev:/${vrf}"
+	cgcreate -g l3mdev:/${vrf} || return 1
+
+	log_cmd "cgset -r l3mdev.master-device=${vrf} ${vrf}"
+	cgset -r l3mdev.master-device=${vrf} ${vrf}
+}
+
 function vrf_delete_cgroup
 {
 	local vrf=${1}
 
 	[ ! -e ${CGRPDIR}/${vrf} ] && return 0
 
+	log_cmd "cgdelete -g l3mdev:/${vrf}"
+
 	# handle transient EBUSY error by trying again
 	for n in $(seq 1 5); do
-		rmdir ${CGRPDIR}/${vrf} 2>/dev/null
+		cgdelete -g l3mdev:/${vrf}
 		[ $? -eq 0 ] && return 0
 		sleep 1
 	done
@@ -120,9 +211,10 @@ function systemd_start_vrf
 {
 	local vrf=${1}
 
-	systemctl --no-block list-units  *.service | \
-	    awk '$1 ~ /@.*.service$/ {print $1}' | \
-	    grep "@${vrf}" | \
+	# start services that have been enabled in a VRF. skip services in
+	# failed state (can lead to cl-support trying to restart them)
+	systemctl -t service --state=active,inactive list-units *@${vrf}.service |\
+	    awk '$1 ~ /.service$/ && $2 == "loaded" {print $1}' | \
 	while read s
 	do
 		systemctl --no-block start ${s}
@@ -134,9 +226,9 @@ function systemd_stop_vrf
 {
 	local vrf=${1}
 
-	systemctl list-units  *.service | \
-	    awk '$1 ~ /@.*.service$/ {print $1}' | \
-	    grep "@${vrf}" | \
+	# stop active services running in the vrf
+	systemctl -t service --state=active list-units *@${vrf}.service |\
+	    awk '$1 ~ /.service$/ && $2 == "loaded" {print $1}' | \
 	while read s
 	do
 		systemctl stop ${s}
@@ -268,15 +360,28 @@ function check_l3mdev_rule
 # setup default route for vrf - use a very poor metric so other
 # default routes will take precedence. We need a default route
 # to keep the lookups from dropping from one table to the next
-function vrf_add_default_route
+function vrf_add_default_route_v4
 {
 	local tbid=$1
 
 	log_cmd "ip route add table ${tbid} unreachable default metric $RT_METRIC"
 	ip route add table ${tbid} unreachable default metric $RT_METRIC || return 1
+}
+
+function vrf_add_default_route_v6
+{
+	local tbid=$1
 
 	log_cmd "ip -6 route add table ${tbid} unreachable default metric $RT_METRIC"
 	ip -6 route add table ${tbid} unreachable default metric $RT_METRIC || return 1
+}
+
+function vrf_add_default_route
+{
+	local tbid=$1
+
+	vrf_add_default_route_v4 ${tbid}
+	vrf_add_default_route_v6 ${tbid}
 }
 
 function vrf_remove_default_route
@@ -305,7 +410,7 @@ function vrf_verify_default_route
 	ip -6 route ls table ${tbid} | grep -q "unreachable default "
 	if [ $? -ne 0 ]; then
 		echo "    ERROR: IPv6 default route missing"
-		rc=1
+		rc=${MISSING_IPV6_DEF_RT}
 	fi
 
 	if [ $rc -eq 0 ]; then
@@ -320,13 +425,15 @@ function vrf_configure
 {
 	local vrf
 	local tbid
-	local mode=$3
+	local rc
 
 	vrf=$(get_vrf_arg ${1})
 	[ $? -ne 0 ] && return 1
 
 	tbid=$(get_tbid_arg ${2})
 	[ $? -ne 0 ] && return 1
+
+	local mode=$3
 
 	# vrf_configure can be called directly; make sure args exist
 	if [ -z "$tbid" ]; then
@@ -339,14 +446,20 @@ function vrf_configure
 		return 1
 	fi
 
-	# use ip route to create the cgroup and add bpf program
-	# this can always be done to reload the bpf program to
-	# ensure the right index is used
-	ip vrf exec ${vrf} id >/dev/null 2>&1
-
 	# only rebuild the VRF if it is not configured properly
 	verify_vrf_one ${vrf} ${tbid} "yes" >/dev/null 2>&1
-	[ $? -eq 0 ] && return 0
+	rc=$?
+	[ ${rc} -eq 0 ] && return 0
+
+	# special case rebuilds - ifdown can take down the 'lo'
+	# device which removes the default route in the IPv6 table
+	# rather than rebuild the VRF for an easy fix, just replace
+	# the default route. For any other errors, the VRF is
+	# rebuilt
+	if [ ${rc} -eq ${MISSING_IPV6_DEF_RT} ]; then
+		vrf_add_default_route_v6 ${tbid}
+		[ $? -eq 0 ] && return 0
+	fi
 
 	# make sure old remnants of prior vrf are removed
 	# no need if this boot up
@@ -357,6 +470,12 @@ function vrf_configure
 	vrf_add_default_route ${tbid}
 	if [ $? -ne 0 ]; then
 		echo "Failed to install default routes"
+		return 1
+	fi
+
+	vrf_configure_cgroup ${vrf}
+	if [ $? -ne 0 ]; then
+		echo "Failed to configure cgroup"
 		return 1
 	fi
 
@@ -513,6 +632,9 @@ function link_usage
 Links associated with VRF domains:
     $PROG link list [<vrf-name>]
 EOF
+    # Unsupported options for customers; tooling and automated testing only
+    # $PROG link add <vrf-name> dev <dev-name>
+    # $PROG link remove dev <dev-name>
 }
 
 function link_list_vrf
@@ -547,6 +669,54 @@ function link_list
 	echo
 }
 
+function link_add
+{
+	local vrf
+	local dev=${3}
+
+	vrf=$(get_vrf_arg ${1})
+	[ $? -ne 0 ] && return 1
+
+	if [ "$2" != "dev" -o -z "$3" -o -n "$4" ];
+	then
+		link_usage
+		return 1
+	fi
+
+	dev_exists $vrf
+	if [ $? -ne 0 ]; then
+		echo "VRF does not exist"
+		return 1
+	fi
+
+	dev_exists $dev
+	if [ $? -ne 0 ]; then
+		echo "dev does not exist"
+		return 1
+	fi
+
+	ip link set dev $dev master ${vrf}
+}
+
+function link_remove
+{
+	local dev=$2
+
+	if [ "$1" != "dev" -o -z "$2" -o -n "$3" ];
+	then
+		link_usage
+		return 1
+	fi
+
+	ip -o -d link show ${dev} 2>/dev/null | grep -q vrf_slave
+	if [ $? -ne 0 ]; then
+		echo "dev is not a VRF slave"
+		return 1
+	fi
+
+	ip link set dev $dev nomaster
+}
+
 function link_cmd
 {
 	local cmd=$1
@@ -554,10 +724,148 @@ function link_cmd
 
 	case "$cmd" in
 		ls|list|sh|show) link_list   $*;;
+
+		####################################################
+		# these options are for testing and tooling; they
+		# are not intended for use by customers
+		a|add)        link_add    $*;;
+		r|rem|remove) link_remove $*;;
+		####################################################
+
 		help)         link_usage;;
 		*)            link_usage; return 1;;
 	esac
 }
+
+################################################################################
+# route management
+
+function route_usage
+{
+cat <<EOF
+
+Routes for a VRF domain:
+    $PROG route list [<vrf-name>]
+EOF
+    # Unsupported options for customers; tooling and automated testing only
+    # $PROG route {add|delete} <vrf-name> <route spec>
+    # $PROG route get <vrf-name> <host>
+}
+
+function route_show_vrf
+{
+	local vrf=${1}
+
+	dev_exists $vrf
+	if [ $? -ne 0 ]; then
+		echo "VRF does not exist"
+		return 1
+	fi
+
+	local tbid=$(vrf_get_table $vrf)
+
+	printf "\nVRF: %-16s\n" $vrf
+	echo "--------------------"
+
+	ip route show table $tbid
+	echo
+	ip -6 route show table $tbid
+}
+
+function route_show
+{
+	local vrf="$*"
+
+	if [ -z "$vrf" ];
+	then
+		vrf=$(vrf_get_list)
+	fi
+
+	for v in ${vrf}
+	do
+		route_show_vrf ${v}
+	done
+
+	echo
+}
+
+function route_add
+{
+	local vrf
+
+	vrf=$(get_vrf_arg ${1})
+	[ $? -ne 0 ] && return 1
+
+	shift
+
+	dev_exists $vrf
+	if [ $? -ne 0 ]; then
+		echo "VRF does not exist"
+		return 1
+	fi
+	local tbid=$(vrf_get_table $vrf)
+
+	ip route add table $tbid $*
+}
+
+function route_delete
+{
+	local vrf
+
+	vrf=$(get_vrf_arg ${1})
+	[ $? -ne 0 ] && return 1
+
+	shift
+
+	dev_exists $vrf
+	if [ $? -ne 0 ]; then
+		echo "VRF does not exist"
+		return 1
+	fi
+	local tbid=$(vrf_get_table $vrf)
+
+	ip route del table $tbid $*
+}
+
+function route_get
+{
+	local vrf
+
+	vrf=$(get_vrf_arg ${1})
+	[ $? -ne 0 ] && return 1
+
+	shift
+
+	dev_exists $vrf
+	if [ $? -ne 0 ]; then
+		echo "VRF does not exist"
+		return 1
+	fi
+
+	ip route get oif $vrf $*
+}
+
+function route_cmd
+{
+	local cmd=$1
+	shift
+
+	case "$cmd" in
+		ls|list|sh|show)  route_show $*;;
+		get)          route_get $*;;
+
+		####################################################
+		# these options are for testing and tooling; they
+		# are not intended for use by customers
+		a|add)        route_add $*;;
+		d|del|delete) route_delete $*;;
+		####################################################
+
+		help)         route_usage;;
+		*)            route_usage; return 1;;
+	esac
+}
+
 
 ################################################################################
 # task management
@@ -587,17 +895,28 @@ function task_list_vrf
 	printf "\nVRF: %-16s\n" $vrf
 	echo "-----------------------"
 
-	ip vrf pids ${vrf} |\
-	while read p
-	do
-		c=$(get_comm $p)
-		[ -n "$c" ] && printf "%-16s  %5s\n" $c $p
-	done
+	local f="${CGRPDIR}/${vrf}/cgroup.procs"
+	if [ ! -e $f ]; then
+		echo "No cgroup for vrf"
+	else
+		while read p
+		do
+			c=$(get_comm $p)
+			printf "%-16s  %5s\n" $c $p
+		done < $f
+	fi
 }
 
 # show VRF for specific task
 function task_identify
 {
+	local do_prompt=0
+
+	if [ "$1" = "prompt" ]; then
+		do_prompt=1
+		shift
+	fi
+
 	# allow syntax to be ... pid <pid>
 	[ "$1" = "pid" ] && shift
 	pid=$*
@@ -605,15 +924,22 @@ function task_identify
 	# default to parent PID (not this commands PID)
 	[ -z "$pid" ] && pid=$PPID
 
-	c=$(ip vrf id $pid)
+	c=$(vrf_get_cgroup $pid)
 	if [ $? -ne 0 ]; then
 		echo "$c"
 		return 1
 	fi
 
-	[ -z "$c" ] && c="default"
-
-	echo "$c"
+	if [ -n "$c" ]; then
+		if [ $do_prompt = "1" ]; then
+			c=$(normalize_vrf_name $c)
+			echo ":$c"
+		else
+			echo "$c"
+		fi
+	elif [ $do_prompt != "1" ]; then
+		echo "default"
+	fi
 }
 
 function task_list
@@ -643,12 +969,12 @@ function task_list
 function task_set
 {
 	local vrf
+	local pid
 
 	vrf=$(get_vrf_arg ${1})
 	[ $? -ne 0 ] && return 1
 
-	local pid=${2//[^0-9]/}
-
+	pid=${2//[^0-9]/}
 	if [ "$pid" != "$2" ]; then
 		echo "Invalid process id"
 		return 1
@@ -671,17 +997,6 @@ function task_set
 		return 1
 	fi
 
-	if [ -z "${CGRPDIR}" ]; then
-		echo "cgroup2 not mounted"
-		return 1
-	fi
-
-	# cgroup has not been configured; use ip-vrf-exec to create
-	# the cgroup with bpf filter so we can set the task id
-	if [ ! -d ${CGRPDIR}/${vrf} ]; then
-		ip vrf exec ${vrf} id >/dev/null 2>&1
-	fi
-
 	if [ "$vrf" = "default" ]; then
 		echo $pid >> ${CGRPDIR}/cgroup.procs
 	else
@@ -699,18 +1014,44 @@ function task_exec
 
 	shift
 
+	vrf_exists $vrf
+	if [ $? -ne 0 ]; then
+		echo "ERROR: VRF does not exist"
+		return 1
+	fi
+
 	if [ -z "$1" ]; then
 		echo "ERROR: No command to run"
 		return 1
 	fi
 
-	ip vrf exec ${vrf} $*
+	if [ "$vrf" = "default" ]; then
+		exec cgexec -g l3mdev:/ $*
+	else
+		vrf_cgroup_exists $vrf >/dev/null 2>&1
+		if [ $? -ne 0 ]; then
+			echo "ERROR: cgroup does not exist for VRF"
+			return 1
+		fi
+
+		# make sure cgroup has master device set
+		cgget -g l3mdev:/${vrf} -v -n | grep -q " ==> $vrf"
+		if [ $? -ne 0 ]; then
+			echo "ERROR: cgroup is misconfigured for VRF"
+			return 1
+		fi
+
+		exec cgexec -g l3mdev:/${vrf} $*
+	fi
 }
 
 function task_cmd
 {
 	local cmd=$1
 	shift
+
+	l3mdev_cgroup_exists
+	[ $? -ne 0 ] && return 1
 
 	case "$cmd" in
 		sh|show|li|list|ls) task_list $*;;
@@ -729,6 +1070,37 @@ function task_cmd
 
 ################################################################################
 # verify config for existing vrfs
+
+function verify_vrf_cgroup
+{
+	local vrf=$1
+
+	vrf_cgroup_exists $vrf >/dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		echo "    ERROR: cgroup does not exist"
+		return 1
+	fi
+
+	idx=$(dev_index $vrf)
+	if [ $? -ne 0 ]; then
+		echo "    ERROR: Failed to get device index; cgroup may be misconfigured"
+		return 1
+	fi
+
+	# l3mdev.master-device file has line:
+	#     net[4026531957]: device index 62 ==> red
+	# important part is the index N ==> dev-name
+
+	cgget -g l3mdev:/${vrf} -v -n | grep -q "index $idx ==> $vrf"
+	if [ $? -ne 0 ]; then
+		echo "    ERROR: cgroup is misconfigured"
+		return 1
+	fi
+
+	echo "    cgroup looks ok"
+
+	return 0
+}
 
 function verify_local_table
 {
@@ -820,6 +1192,7 @@ function verify_vrf_one
 	local table_check=$3
 	local rc=0
 	local rm_files=no
+	local tmp_rc
 
 	if [ "$table_check" = "yes" ]; then
 		local tbid_chk=$(vrf_get_table $vrf)
@@ -840,7 +1213,7 @@ function verify_vrf_one
 		return 1
 	fi
 
-	if [ -z ${IPRUFILE} -a "${HAVE_L3MDEV_RULE}" != "yes" ]; then
+	if [ -z "${IPRUFILE}" -a "${HAVE_L3MDEV_RULE}" != "yes" ]; then
 		IPRUFILE=$(mktemp /tmp/vrf-ip.XXXXXXXX)
 		IP6RUFILE=$(mktemp /tmp/vrf-ip6.XXXXXXXX)
 		ip ru ls >> ${IPRUFILE}
@@ -848,10 +1221,16 @@ function verify_vrf_one
 		rm_files=yes
 	fi
 
+	# keep rc and pass back to caller; used to catch missing
+	# ipv6 default route
 	vrf_verify_default_route $tbid
-	[ $? -ne 0 ] && rc=1
+	tmp_rc=$?
+	[ ${tmp_rc} -ne 0 ] && rc=${tmp_rc}
 
 	verify_vrf_fib_rules $vrf $tbid
+	[ $? -ne 0 ] && rc=1
+
+	verify_vrf_cgroup $vrf
 	[ $? -ne 0 ] && rc=1
 
 	[ "$rm_files" = "yes" ] && rm -f ${IPRUFILE} ${IP6RUFILE}
@@ -977,6 +1356,7 @@ VRF domains:
     $PROG list
 EOF
 	link_usage
+	route_usage
 	task_usage
 }
 
@@ -988,9 +1368,6 @@ if [ "$1" = "-v" ]; then
 	VERBOSE=1
 	shift
 fi
-
-CGRPDIR=$(mount |awk '$0 ~ /type cgroup2/{print $3}')
-[ -n "${CGRPDIR}" ] && CGRPDIR=${CGRPDIR}/vrf
 
 check_l3mdev_rule
 
@@ -1015,6 +1392,7 @@ case "$CMD" in
 	id|identify)   task_identify $*;;
 
 	li|link)  link_cmd $*;;
+	ro|route) route_cmd $*;;
 
 	# used by mgmt-vrf and dhclient exit hook
 	table) vrf_table $*;;

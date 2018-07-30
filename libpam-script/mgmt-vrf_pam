@@ -5,16 +5,9 @@ if [ "$PAM_SERVICE" = "sudo" ]; then
 	exit 0
 fi
 
-# allow "sudo ip vrf exec VRF su - USER" to change VRF
-# and allow "sudo ip netns exec foo su - USER" to change
-# namespace and drop the VRF assumption
-
-echo "${SUDO_COMMAND}" | grep -q 'vrf exec '
-[ $? -eq 0 ] && exit 0
-
 mgmt-vrf status >/dev/null 2>&1
 if [ $? -eq 0 ]; then
-	VRF=$(ip vrf identify)
+	VRF=$(vrf identify prompt)
 	if [ -z "$VRF" ]; then
 		if [ -z "$PAMSCRIPT_PPID" ]; then
 			logger -p auth.err "PAMSCRIPT_PPID not set; can not set VRF context"
@@ -23,10 +16,6 @@ if [ $? -eq 0 ]; then
 
 		mgmt-vrf set $PAMSCRIPT_PPID
 	fi
-else
-	# make sure task is set to default context
-	# e.g, changing namespaces and mgmt vrf does not exit is new ns.
-	vrf task set default $PAMSCRIPT_PPID
 fi
 
 exit 0

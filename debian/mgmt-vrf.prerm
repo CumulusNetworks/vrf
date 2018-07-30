@@ -4,6 +4,15 @@ set -e
 
 DIVERT_DIR=/usr/share/mgmt-vrf
 
+# uninstall alternatives to ping and traceroute
+for f in /usr/bin/traceroute /usr/sbin/traceroute /usr/bin/traceroute6 /bin/ping /bin/ping6
+do
+	[ ! -e ${DIVERT_DIR}/${f} ] && continue
+	dpkg-divert --remove ${f}
+	rm -f ${f}
+	mv -f ${DIVERT_DIR}/${f} ${f}
+done
+
 # remove libpam-script config
 VRF_PAM_SCRIPT=/usr/share/mgmt-vrf/libpam-script
 PAM_SCRIPT=/usr/share/libpam-script

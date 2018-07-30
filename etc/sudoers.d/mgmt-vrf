@@ -1,0 +1,5 @@
+Defaults env_keep += VRF
+
+# need to be able to reset VRF context to default to run
+# ping and traceroute wrappers
+ALL ALL = NOPASSWD: /usr/bin/vrf task set default [0-9]*

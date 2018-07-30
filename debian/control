@@ -1,14 +1,15 @@
 Source: vrf
 Section: net
 Priority: optional
-Maintainer: Cumulus Networks <dev-support@cumulusnetworks.com>
-Build-Depends: debhelper (>=9)
+Maintainer: dev-support <dev-support@cumulusnetworks.com>
+Build-Depends: debhelper (>=9),
+ libnl-3-dev, libnl-route-3-dev, libnl-3-200, libnl-route-3-200
 Standards-Version: 3.9.6
 Homepage: http://www.cumulusnetworks.com
 
 Package: vrf
-Architecture: all
-Depends: iproute2
+Architecture: any
+Depends: iproute2, cgroup-tools, libcap2-bin
 Description: Linux tools for VRF
  This package provides tools for configuring and using the VRF
  (Virtual Routing and Forwarding) feature in Linux.
