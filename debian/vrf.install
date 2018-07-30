@@ -1,8 +1,9 @@
 bin/vrf			usr/bin
+src/runvrf		usr/lib/cumulus
 etc/profile.d/vrf.sh	etc/profile.d
 etc/vrf/*		etc/vrf
-lib-vrf/*		usr/lib/vrf
+lib-vrf/vrf-helper	usr/lib/vrf
+lib-vrf/vrf-dns-helper	usr/lib/vrf
 systemd/dns-watcher.service	lib/systemd/system
 systemd/systemd-vrf-generator	lib/systemd/system-generators
 etc/dhcp/dhclient-exit-hooks.d/*        etc/dhcp/dhclient-exit-hooks.d
-ifupdown2/policy.d/vrf.json	var/lib/ifupdown2/policy.d

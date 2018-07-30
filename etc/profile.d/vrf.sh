@@ -1,5 +1,4 @@
-VRF=$(ip vrf identify)
-[ -n "${VRF}" ] && VRF=":${VRF}"
+VRF=$(vrf identify prompt)
 export VRF
 
 PS1='\u@\h${VRF}:\w\$ '

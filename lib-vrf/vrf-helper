@@ -6,7 +6,7 @@
 PROG=${0##*/}
 VERBOSE=0
 
-DNS_HELPER=/usr/lib/mgmt-vrf/vrf-dns-helper
+DNS_HELPER=/usr/lib/vrf/vrf-dns-helper
 
 ################################################################################
 # usage

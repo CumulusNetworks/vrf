@@ -3,9 +3,12 @@
 # Generate systemd files for running a systemd-based service
 # in a VRF. Generator creates instance templates for services
 # that do not have them and creates unit overrides to prepend
-# 'ip vrf exec %i' to all Exec lines.
+# 'runvrf %i' to all Exec lines.
 
 PROG=systemd-vrf-generator
+
+# command to use to run other commands in a VRF
+RUNVRF="/bin/ip vrf exec"
 
 # config file noting services that might run in a VRF
 VRFCONF=/etc/vrf/systemd.conf
@@ -63,7 +66,7 @@ create_instance_sysv()
 	while read line; do
 		if [[ $line =~ (Exec[^=]+=[[:space:]]*[^/]*)(\/.*) ]]; then
 			# use full match here to keep all context
-			echo "${BASH_REMATCH[1]}/bin/ip vrf exec %i ${BASH_REMATCH[2]}"
+			echo "${BASH_REMATCH[1]}${RUNVRF} %i ${BASH_REMATCH[2]}"
 		else
 			echo "$line"
 			if [ "$line" = "[Service]" ]; then
@@ -83,7 +86,7 @@ create_instance_sysv()
 
 # Admins can create unit override files. Those files should exist for
 # instance services as well. Additionally, if those files contain Exec
-# lines then the commands need to be prefaced with ip vrf exec
+# lines then the commands need to be prefaced with runvrf
 handle_overrides()
 {
 	local s=$1
@@ -107,7 +110,7 @@ handle_overrides()
 			if [[ $line =~ (Exec[^=]+=[[:space:]]*[^/]*)(\/.*) ]]; then
 				[ -z "${BASH_REMATCH[2]}" ] && continue
 				# use full match here to keep all context
-				echo "${BASH_REMATCH[1]}/bin/ip vrf exec %i ${BASH_REMATCH[2]}"
+				echo "${BASH_REMATCH[1]}${RUNVRF} %i ${BASH_REMATCH[2]}"
 			else
 				echo "${line}"
 			fi
@@ -158,7 +161,7 @@ create_vrf_override()
 			[ $? -eq 1 ] && echo "${d}="
 
 			# use full match here to keep all context
-			echo "${BASH_REMATCH[1]}/bin/ip vrf exec %i ${BASH_REMATCH[2]}"
+			echo "${BASH_REMATCH[1]}${RUNVRF} %i ${BASH_REMATCH[2]}"
 		fi
 	done < ${ifile}
 
